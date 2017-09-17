@@ -48,6 +48,15 @@ namespace NetMQ
 
 #if !NET35
         private readonly NetMQQueue<Task> m_tasksQueue = new NetMQQueue<Task>();
+
+        /// <summary>
+        /// Used by <see cref="NetMQSynchronizationContext.Post"/>. In contrast
+        /// to <see cref="m_tasksQueue"/>, exceptions thrown by these actions
+        /// are not caught and put into a Task (which will never be observed);
+        /// instead, they simply propagate up on the poller thread.
+        /// </summary>
+        private readonly NetMQQueue<PostCallbackWithState> m_syncContextPostedQueue = new NetMQQueue<PostCallbackWithState>();
+
         private readonly ThreadLocal<bool> m_isSchedulerThread = new ThreadLocal<bool>(() => false);
 
         /// <summary>
@@ -140,7 +149,18 @@ namespace NetMQ
                     TryExecuteTask(task);
             };
 
+            m_syncContextPostedQueue.ReceiveReady += delegate
+            {
+                Debug.Assert(m_disposeState != (int)DisposeState.Disposed);
+                Debug.Assert(IsRunning);
+
+                // Try to dequeue and execute all pending posted things
+                while (m_syncContextPostedQueue.TryDequeue(out PostCallbackWithState callback, TimeSpan.Zero))
+                    callback.Run();
+            };
+
             m_sockets.Add(((ISocketPollable)m_tasksQueue).Socket);
+            m_sockets.Add(((ISocketPollable)m_syncContextPostedQueue).Socket);
 #endif
         }
 
@@ -645,6 +665,7 @@ namespace NetMQ
             m_stopSignaler.Dispose();
 #if !NET35
             m_tasksQueue.Dispose();
+            m_syncContextPostedQueue.Dispose();
 #endif
 
             foreach (var socket in m_sockets)
@@ -703,18 +724,34 @@ namespace NetMQ
             }
 
             /// <summary>Dispatches an asynchronous message to a synchronization context.</summary>
-            public override void Post(SendOrPostCallback d, object state)
+            public override void Post(SendOrPostCallback d, [CanBeNull] object state)
             {
-                var task = new Task(() => d(state));
-                task.Start(m_poller);
+                m_poller.m_syncContextPostedQueue.Enqueue(new PostCallbackWithState(d, state));
             }
 
             /// <summary>Dispatches a synchronous message to a synchronization context.</summary>
-            public override void Send(SendOrPostCallback d, object state)
+            public override void Send(SendOrPostCallback d, [CanBeNull] object state)
             {
                 var task = new Task(() => d(state));
                 task.Start(m_poller);
                 task.Wait();
+            }
+        }
+
+        private struct PostCallbackWithState
+        {
+            private readonly SendOrPostCallback callback;
+            [CanBeNull] private readonly object state;
+
+            public PostCallbackWithState(SendOrPostCallback callback, [CanBeNull] object state)
+            {
+                this.callback = callback;
+                this.state = state;
+            }
+
+            public void Run()
+            {
+                callback(state);
             }
         }
 #endif
